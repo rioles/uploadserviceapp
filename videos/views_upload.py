@@ -24,32 +24,49 @@ class UploadChunkView(APIView):
     # Injection de ton système Keycloak au niveau de la vue
     authentication_classes = [KeycloakAuthentication]
     permission_classes = [IsAuthenticated]
-
+    
     def post(self, request, *args, **kwargs):
-        # 1. Validation de la forme de la requête
+        logger.info("========== UPLOAD CHUNK START ==========")
+
         serializer = ChunkUploadSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        logger.info("1. Serializer OK")
+
         validated_data = serializer.validated_data
-
-        # En Django, pour que le DTO puisse lire request.user.id de manière transparente :
-        # On injecte la propriété attendue par notre méthode ChunkData.from_request
         request.keycloak_user_id = request.user.id
-
-        # 2. Construction du DTO initial (génère l'UUID7 de chunk_id automatiquement)
+        logger.info(f"2. User OK: {request.user.id}")
         chunk_dto = ChunkData.from_request(request)
-
-        # 3. Lecture et upload physique du Blob binaire vers S3
-        chunk_file_bytes = validated_data['chunk'].read()
-        s3_key = get_storage().upload(
-            chunk=chunk_file_bytes,
-            video_id=chunk_dto.video_id,
-            chunk_index=chunk_dto.chunk_index
+        logger.info(
+            f"3. DTO OK: video={chunk_dto.video_id}, "
+            f"index={chunk_dto.chunk_index}, "
+            f"hash={chunk_dto.sha256[:16]}..."
         )
-        print("this is the key", s3_key)
-        # 4. Envoi du DTO enrichi de sa clé S3 vers Celery au format dictionnaire
+        logger.info("4. Starting S3 upload...")
+        try:
+            chunk_file_bytes = validated_data['chunk'].read()
+            logger.info(
+                f"5. Chunk read OK: {len(chunk_file_bytes)} bytes"
+            )
+            s3_key = get_storage().upload(
+                chunk=chunk_file_bytes,
+                video_id=chunk_dto.video_id,
+                chunk_index=chunk_dto.chunk_index
+            )
+            logger.info(f"6. S3 upload OK: {s3_key}")
+        except Exception:
+            logger.exception("❌ S3 UPLOAD FAILED")
+            raise
         final_chunk_dto = chunk_dto.with_s3_key(s3_key)
-        persist_chunk.delay(final_chunk_dto.to_dict())
-
+        logger.info("7. Sending task to Celery...")
+        try:
+            result = persist_chunk.delay(final_chunk_dto.to_dict())
+            logger.info(
+                f"8. Celery task submitted successfully: {result.id}"
+            )
+        except Exception:
+            logger.exception("❌ CELERY SUBMISSION FAILED")
+            raise
+        logger.info("========== UPLOAD CHUNK END ==========")
         return Response({'status': 'ok'}, status=200)
 
 

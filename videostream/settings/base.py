@@ -224,3 +224,5 @@ CORS_ALLOW_METHODS = [
 ]
 
 CORS_ALLOW_CREDENTIALS = True
+# Empêche Django d'envoyer un HTTP 301 Redirect si le slash manque
+APPEND_SLASH = False
