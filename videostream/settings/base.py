@@ -186,3 +186,41 @@ TRANSCODE_QUEUE_URL = os.environ.get(
     "TRANSCODE_QUEUE_URL",
     "https://sqs.us-east-1.amazonaws.com/868480224885/video-streaming-cluster-transcode-queue"
 )
+
+# ──────────────────────────────────────────
+# Configuration CORS (django-cors-headers)
+# ──────────────────────────────────────────
+
+# Origins autorisées (Next.js en local + votre domaine Frontend s'il y en a un)
+CORS_ALLOWED_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
+
+# Si vous voulez autoriser dynamiquement l'URL ngrok ou le Gateway en dev :
+# CORS_ALLOW_ALL_ORIGINS = True  # A utiliser uniquement pour le debug rapide
+
+# Indispensable pour la requête Preflight (OPTIONS) de Next.js qui envoie le Token Keycloak
+CORS_ALLOW_HEADERS = [
+    "accept",
+    "accept-encoding",
+    "authorization",
+    "content-type",
+    "dnt",
+    "origin",
+    "user-agent",
+    "x-csrftoken",
+    "x-requested-with",
+]
+
+# Méthodes HTTP autorisées
+CORS_ALLOW_METHODS = [
+    "DELETE",
+    "GET",
+    "OPTIONS",
+    "PATCH",
+    "POST",
+    "PUT",
+]
+
+CORS_ALLOW_CREDENTIALS = True
