@@ -1,0 +1,40 @@
+# Git & general VCS
+.git
+.gitignore
+.github
+
+# Python environment & cache
+venv/
+.venv/
+env/
+.env/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+
+# Local configuration / secrets
+.env
+.env.dev
+.env.pro
+.env.*
+
+# Local databases (if any)
+*.sqlite3
+
+# Docker files (no need to copy inside image)
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+
+# Temporary, docs & prompt directories
+prompts/
+videos/tests.py
+test_merge.py
+README.md
+docs/

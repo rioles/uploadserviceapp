@@ -1,0 +1,140 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: upload-service-postgres
+    environment:
+      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: upload-service-redis
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  upload-service:
+    image: 19911992/upload-service:latest
+    container_name: upload-service
+    ports:
+      - "8000:8000"
+    environment:
+      # Django core
+      ENVIRONMENT: dev
+      DJANGO_ENV: dev
+      DEBUG: "True"
+      SECRET_KEY: ${SECRET_KEY}
+      ALLOWED_HOSTS: "*"
+      PORT: 8000
+
+      # Database (postgres local, service Compose)
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_HOST: postgres
+      DB_SSL_MODE: disable
+
+      # Redis (redis local, service Compose)
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_DB: 0
+      REDIS_PASSWORD: ""
+      REDIS_SSL: "False"
+
+      # AWS
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_S3_BUCKET: ${AWS_S3_BUCKET}
+      AWS_DEFAULT_REGION: us-east-1
+      DYNAMODB_CHUNK_TABLE: ${DYNAMODB_CHUNK_TABLE}
+
+      # SQS
+      TRANSCODE_QUEUE_URL: ${TRANSCODE_QUEUE_URL}
+
+      # Keycloak
+      KEYCLOAK_URL: ${KEYCLOAK_URL}
+      KEYCLOAK_REALM: ${KEYCLOAK_REALM}
+      KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID}
+      KEYCLOAK_CLIENT_SECRET: ${KEYCLOAK_CLIENT_SECRET}
+      KEYCLOAK_ISSUER_URI: ${KEYCLOAK_ISSUER_URI}
+      KEYCLOAK_JWK_SET_URI: ${KEYCLOAK_JWK_SET_URI}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  celery-worker:
+    image: 19911992/upload-service:latest
+    container_name: upload-service-celery
+    command: celery -A videostream worker --loglevel=info
+    environment:
+      # Django core
+      ENVIRONMENT: dev
+      DJANGO_ENV: dev
+      DEBUG: "True"
+      SECRET_KEY: ${SECRET_KEY}
+      ALLOWED_HOSTS: "*"
+
+      # Database (postgres local, service Compose)
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_HOST: postgres
+      DB_SSL_MODE: disable
+
+      # Redis (redis local, service Compose)
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_DB: 0
+      REDIS_PASSWORD: ""
+      REDIS_SSL: "False"
+
+      # AWS
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_S3_BUCKET: ${AWS_S3_BUCKET}
+      AWS_DEFAULT_REGION: us-east-1
+      DYNAMODB_CHUNK_TABLE: ${DYNAMODB_CHUNK_TABLE}
+
+      # SQS
+      TRANSCODE_QUEUE_URL: ${TRANSCODE_QUEUE_URL}
+
+      # Keycloak
+      KEYCLOAK_URL: ${KEYCLOAK_URL}
+      KEYCLOAK_REALM: ${KEYCLOAK_REALM}
+      KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID}
+      KEYCLOAK_CLIENT_SECRET: ${KEYCLOAK_CLIENT_SECRET}
+      KEYCLOAK_ISSUER_URI: ${KEYCLOAK_ISSUER_URI}
+      KEYCLOAK_JWK_SET_URI: ${KEYCLOAK_JWK_SET_URI}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      upload-service:
+        condition: service_started
+
+volumes:
+  postgres_data:
+  redis_data:
