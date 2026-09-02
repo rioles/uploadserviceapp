@@ -1,11 +1,18 @@
 # videos/tasks/finalizer.py
 import logging
 import boto3
+from videostream.telemetry import setup_tracing
 
+tracer = setup_tracing()
 from celery import shared_task
 from django.conf import settings
 from django.db import transaction
 import hashlib
+
+from opentelemetry import trace
+from opentelemetry.propagate import inject
+
+tracer = trace.get_tracer(__name__)
 
 from videos.schemas import ChunkOrder, FinalizeData
 
@@ -120,6 +127,7 @@ def _build_dynamo_items(new_chunks: list[ChunkOrder]) -> list[dict]:
         })
     return items
 
+   
 
 def _store_dynamo_batch(items: list[dict]) -> None:
     """
@@ -128,11 +136,25 @@ def _store_dynamo_batch(items: list[dict]) -> None:
     """
     if not items:
         return
-    table = get_dynamo_table()
-    with table.batch_writer() as writer:
-        for item in items:
-            writer.put_item(Item=item)
-    logger.info(f"[DYNAMO SUCCESS] {len(items)} items écrits dans DynamoDB.")
+
+    with tracer.start_as_current_span("dynamodb.store_chunk_batch") as span:
+        span.set_attribute("dynamodb.items_count", len(items))
+
+        try:
+            table = get_dynamo_table()
+            span.set_attribute("dynamodb.table_name", table.table_name)
+
+            with table.batch_writer() as writer:
+                for item in items:
+                    writer.put_item(Item=item)
+
+            logger.info(f"[DYNAMO SUCCESS] {len(items)} items écrits dans DynamoDB.")
+
+        except Exception as e:
+            span.record_exception(e)
+            span.set_status(trace.Status(trace.StatusCode.ERROR, str(e)))
+            logger.error(f"[DYNAMO ERROR] Échec de l'écriture batch DynamoDB : {e}", exc_info=True)
+            raise
 
 
 def _verify_integrity(video_id: str, total_chunks: int) -> None:
@@ -171,9 +193,7 @@ def get_sqs_client():
 
     return _sqs_client
     
-
-
-
+    
 def _send_transcode_message(
     video_id: str,
     complete_chunks: list[dict],
@@ -182,30 +202,53 @@ def _send_transcode_message(
 ) -> None:
     """
     Envoie un message SQS vers le worker transcoder (Java/MediaConvert).
-    
-    - Si is_deduplicated=True : complete_chunks est vide, composite_hash est transmis 
+
+    - Si is_deduplicated=True : complete_chunks est vide, composite_hash est transmis
       pour permettre la duplication des VideoFormats par le worker.
     - Si is_deduplicated=False : complete_chunks contient la liste ordonnée des chunks
       pour effectuer le transcodage HLS multi-résolution.
     """
-    message_body = {
-        'video_id': video_id,
-        'composite_hash': composite_hash,
-        'is_deduplicated': is_deduplicated,
-        'chunks': complete_chunks,  # Liste vide [] si dédupliqué, sinon liste ordonnée
-        'target_resolutions': ['1080p', '720p', '480p', '360p'],
-    }
+    with tracer.start_as_current_span("sqs.send_transcode_message") as span:
+        span.set_attribute("video.id", video_id)
+        span.set_attribute("video.is_deduplicated", is_deduplicated)
+        span.set_attribute("video.chunks_count", len(complete_chunks))
+        if composite_hash:
+            span.set_attribute("video.composite_hash", composite_hash)
 
-    sqs = get_sqs_client()
-    response = sqs.send_message(
-        QueueUrl=settings.TRANSCODE_QUEUE_URL,
-        MessageBody=json.dumps(message_body)
-    )
-    
-    logger.info(
-        f"[SQS SUCCESS] Message de transcodage envoyé pour la vidéo {video_id} "
-        f"(Deduplicated: {is_deduplicated}, MessageId: {response['MessageId']})."
-    )
+        message_body = {
+            'video_id': video_id,
+            'composite_hash': composite_hash,
+            'is_deduplicated': is_deduplicated,
+            'chunks': complete_chunks,  # Liste vide [] si dédupliqué, sinon liste ordonnée
+            'target_resolutions': ['1080p', '720p', '480p', '360p'],
+        }
+
+        # Propagation du contexte de trace vers le service transcoder (Java)
+        # via les MessageAttributes SQS, pour relier les deux services dans une trace unique.
+        carrier = {}
+        inject(carrier)
+        message_attributes = {
+            key: {'DataType': 'String', 'StringValue': value}
+            for key, value in carrier.items()
+        }
+
+        try:
+            sqs = get_sqs_client()
+            response = sqs.send_message(
+                QueueUrl=settings.TRANSCODE_QUEUE_URL,
+                MessageBody=json.dumps(message_body),
+                MessageAttributes=message_attributes,
+            )
+            span.set_attribute("sqs.message_id", response['MessageId'])
+
+            logger.info(
+                f"[SQS SUCCESS] Message de transcodage envoyé pour la vidéo {video_id} "
+                f"(Deduplicated: {is_deduplicated}, MessageId: {response['MessageId']})."
+            )
+        except Exception as e:
+            span.record_exception(e)
+            span.set_status(trace.Status(trace.StatusCode.ERROR, str(e)))
+            raise
 
 
 
@@ -221,98 +264,122 @@ def finalize_video(self, finalize_dict: dict):
         chunks_order = [ChunkOrder(**c) for c in data.pop('chunks_order')]
         finalize_data = FinalizeData(**data, chunks_order=chunks_order)
 
-        existing_chunks = [c for c in chunks_order if c.s3_url is not None]
-        new_chunks = [c for c in chunks_order if c.s3_url is None]
+        with tracer.start_as_current_span("video.finalize") as span:
+            span.set_attribute("video.id", finalize_data.upload_id)
+            span.set_attribute("video.total_chunks", finalize_data.total_chunks)
+            span.set_attribute("video.size_bytes", finalize_data.file_size)
 
-        with transaction.atomic():
-            # 1. Enregistrement initial -> Statut PROCESSING
-            video, created = Video.objects.update_or_create(
-                id=finalize_data.upload_id,
-                defaults={
-                    'upload_id': finalize_data.upload_id,
-                    'user_id': finalize_data.user_id,
-                    'title': finalize_data.nom,
-                    'description': finalize_data.description,
-                    'total_chunks': finalize_data.total_chunks,
-                    'size_bytes': finalize_data.file_size,
-                    'status': Video.Status.PROCESSING,
-                }
-            )
+            existing_chunks = [c for c in chunks_order if c.s3_url is not None]
+            new_chunks = [c for c in chunks_order if c.s3_url is None]
+            span.set_attribute("video.existing_chunks_count", len(existing_chunks))
+            span.set_attribute("video.new_chunks_count", len(new_chunks))
 
-            # 2. Association des chunks préexistants & Vérification d'intégrité
-            if existing_chunks:
-                _process_existing_chunks(finalize_data.upload_id, existing_chunks)
-
-            _verify_integrity(finalize_data.upload_id, finalize_data.total_chunks)
-
-            # 3. Assemblage de la liste complète et calcul du composite_hash
-            complete_chunks = _build_complete_chunks_list(chunks_order)
-            composite_hash = compute_video_composite_hash_from_dicts(complete_chunks)
-            video.composite_hash = composite_hash
-
-            # 4. Vérification de déduplication (Vidéo modèle déjà READY)
-            existing_video = Video.objects.filter(
-                composite_hash=composite_hash,
-                status=Video.Status.READY
-            ).exclude(id=video.id).first()
-
-            if existing_video:
-                # ✅ DÉDUPLICATION : Transmission de composite_hash + chunks=[]
-                logger.info(
-                    f"Vidéo {video.id} : dédupliquée depuis la vidéo {existing_video.id}. "
-                    "Mis en file SQS avec is_deduplicated=True."
+            with transaction.atomic():
+                # 1. Enregistrement initial -> Statut PROCESSING
+                video, created = Video.objects.update_or_create(
+                    id=finalize_data.upload_id,
+                    defaults={
+                        'upload_id': finalize_data.upload_id,
+                        'user_id': finalize_data.user_id,
+                        'title': finalize_data.nom,
+                        'description': finalize_data.description,
+                        'total_chunks': finalize_data.total_chunks,
+                        'size_bytes': finalize_data.file_size,
+                        'status': Video.Status.PROCESSING,
+                    }
                 )
+                span.set_attribute("video.record_created", created)
 
-                video.hls_master_s3_key = existing_video.hls_master_s3_key
-                video.duration_s = existing_video.duration_s
-                video.status = Video.Status.QUEUED
-                video.save(update_fields=['composite_hash', 'hls_master_s3_key', 'duration_s', 'status'])
+                # 2. Association des chunks préexistants & Vérification d'intégrité
+                if existing_chunks:
+                    with tracer.start_as_current_span("video.process_existing_chunks"):
+                        _process_existing_chunks(finalize_data.upload_id, existing_chunks)
 
-                transaction.on_commit(
-                    partial(
-                        _send_transcode_message,
-                        video_id=finalize_data.upload_id,
-                        complete_chunks=[],
-                        is_deduplicated=True,
-                        composite_hash=composite_hash
+                with tracer.start_as_current_span("video.verify_integrity"):
+                    _verify_integrity(finalize_data.upload_id, finalize_data.total_chunks)
+
+                # 3. Assemblage de la liste complète et calcul du composite_hash
+                with tracer.start_as_current_span("video.compute_composite_hash"):
+                    complete_chunks = _build_complete_chunks_list(chunks_order)
+                    composite_hash = compute_video_composite_hash_from_dicts(complete_chunks)
+                    video.composite_hash = composite_hash
+
+                span.set_attribute("video.composite_hash", composite_hash)
+
+                # 4. Vérification de déduplication (Vidéo modèle déjà READY)
+                existing_video = Video.objects.filter(
+                    composite_hash=composite_hash,
+                    status=Video.Status.READY
+                ).exclude(id=video.id).first()
+
+                is_deduplicated = existing_video is not None
+                span.set_attribute("video.is_deduplicated", is_deduplicated)
+
+                if existing_video:
+                    span.set_attribute("video.deduplicated_from_id", str(existing_video.id))
+                    # ✅ DÉDUPLICATION : Transmission de composite_hash + chunks=[]
+                    logger.info(
+                        f"Vidéo {video.id} : dédupliquée depuis la vidéo {existing_video.id}. "
+                        "Mis en file SQS avec is_deduplicated=True."
                     )
-                )
 
-            else:
-                # ❌ NOUVEAU CONTENU : Transcodage complet requis par Java
-                logger.info(
-                    f"Vidéo {video.id} : nouveau hash {composite_hash[:8]}, "
-                    "mis en file SQS pour transcodage."
-                )
+                    video.hls_master_s3_key = existing_video.hls_master_s3_key
+                    video.duration_s = existing_video.duration_s
+                    video.status = Video.Status.QUEUED
+                    video.save(update_fields=['composite_hash', 'hls_master_s3_key', 'duration_s', 'status'])
 
-                video.status = Video.Status.QUEUED
-                video.save(update_fields=['composite_hash', 'status'])
-
-                transaction.on_commit(
-                    partial(
-                        _send_transcode_message,
-                        video_id=finalize_data.upload_id,
-                        complete_chunks=complete_chunks,
-                        is_deduplicated=False,
-                        composite_hash=composite_hash
+                    transaction.on_commit(
+                        partial(
+                            _send_transcode_message,
+                            video_id=finalize_data.upload_id,
+                            complete_chunks=[],
+                            is_deduplicated=True,
+                            composite_hash=composite_hash
+                        )
                     )
-                )
 
-            # 5. Indexation DynamoDB pour les nouveaux chunks (Post-commit SQL)
-            if new_chunks:
-                dynamo_items = _build_dynamo_items(new_chunks)
-                transaction.on_commit(
-                    partial(_store_dynamo_batch, dynamo_items)
-                )
+                else:
+                    # ❌ NOUVEAU CONTENU : Transcodage complet requis par Java
+                    logger.info(
+                        f"Vidéo {video.id} : nouveau hash {composite_hash[:8]}, "
+                        "mis en file SQS pour transcodage."
+                    )
 
-        logger.info(f"[FINALIZE SUCCESS] Vidéo {finalize_data.upload_id} mise en file SQS avec succès.")
+                    video.status = Video.Status.QUEUED
+                    video.save(update_fields=['composite_hash', 'status'])
+
+                    transaction.on_commit(
+                        partial(
+                            _send_transcode_message,
+                            video_id=finalize_data.upload_id,
+                            complete_chunks=complete_chunks,
+                            is_deduplicated=False,
+                            composite_hash=composite_hash
+                        )
+                    )
+
+                # 5. Indexation DynamoDB pour les nouveaux chunks (Post-commit SQL)
+                if new_chunks:
+                    dynamo_items = _build_dynamo_items(new_chunks)
+                    transaction.on_commit(
+                        partial(_store_dynamo_batch, dynamo_items)
+                    )
+
+            logger.info(f"[FINALIZE SUCCESS] Vidéo {finalize_data.upload_id} mise en file SQS avec succès.")
 
     except ValueError as exc:
+        span = trace.get_current_span()
+        span.set_attribute("task.retry_count", self.request.retries)
+        span.set_attribute("task.retry_reason", "integrity_not_ready")
         logger.warning(f"[FINALIZE RETRY] Dépendances non prêtes pour {finalize_dict.get('upload_id')}: {exc}")
         raise self.retry(exc=exc, countdown=3)
 
     except Exception as exc:
+        span = trace.get_current_span()
+        span.set_attribute("task.retry_count", self.request.retries)
+
         if self.request.retries >= self.max_retries:
+            span.set_attribute("task.final_failure", True)
             logger.error(f"[FINALIZE FAILED] Échec définitif pour {finalize_dict.get('upload_id')}: {exc}")
             Video.objects.filter(id=finalize_dict.get('upload_id')).update(status=Video.Status.FAILED)
 

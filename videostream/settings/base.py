@@ -26,7 +26,8 @@ if Path(env_file).exists():
     load_dotenv(dotenv_path=env_file)
 #load_dotenv(dotenv_path=f'.env.{ENV}')
 
-
+from videostream.telemetry import setup_tracing
+tracer = setup_tracing()
 
 # 4. Fichiers Statiques et Média
 STATIC_URL = '/static/'

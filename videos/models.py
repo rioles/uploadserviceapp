@@ -93,7 +93,6 @@ class VideoChunk(models.Model):
     def __str__(self):
         return f"Video {self.video_id} [Chunk {self.chunk_index}] -> Chunk Phys. {self.chunk_id}"
 
-
 class VideoFormat(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid6.uuid7, editable=False)
     video = models.ForeignKey(
@@ -101,7 +100,6 @@ class VideoFormat(models.Model):
         on_delete=models.CASCADE,
         db_column='video_id',
         related_name='formats'
-        # L'index individuel sur video_id est créé automatiquement par Django ici
     )
     resolution = models.CharField(max_length=20)  # ex: "1080p", "720p"
     width = models.PositiveIntegerField(blank=True, null=True)
@@ -117,6 +115,10 @@ class VideoFormat(models.Model):
         db_table = 'video_formats'
         indexes = [
             models.Index(fields=['s3_key'], name='idx_formats_s3_key'),
+        ]
+        # CONTRAINTE D'UNICITÉ POUR RENFORCER L'IDEMPOTENCE
+        constraints = [
+            models.UniqueConstraint(fields=['video', 'resolution'], name='uidx_video_resolution')
         ]
 
     def __str__(self):

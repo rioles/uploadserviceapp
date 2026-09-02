@@ -10,7 +10,9 @@ from django.db.models import F
 from videos.schemas import ChunkData
 
 logger = logging.getLogger(__name__)
+from opentelemetry import trace
 
+tracer = trace.get_tracer(__name__)
 
 # ─────────────────────────────────────────────────────────
 # Cuckoo Filter Service
@@ -157,10 +159,35 @@ def _update_cuckoo_filter(chunk_hash: str) -> None:
             
     except Exception as e:
         logger.error(f"❌ [REDIS BLOOM ERROR] Impossible d'écrire le hash {chunk_hash[:16]}... dans Redis : {e}", exc_info=True)
+        
+def _update_cuckoo_filter(chunk_hash: str) -> None:
+    """
+    Ajoute le hash dans le Filtre de Bloom et logue le résultat.
+    Appelé uniquement APRÈS le commit de la transaction PostgreSQL.
+    """
+    with tracer.start_as_current_span("redis.cuckoo_filter.add") as span:
+        span.set_attribute("chunk.sha256", chunk_hash)
+        try:
+            cuckoo = get_cuckoo_service()
+            is_new = cuckoo.add(chunk_hash)
+            span.set_attribute("cuckoo.is_new", is_new)
+            span.set_attribute("cuckoo.key", cuckoo.key)
+
+            if is_new:
+                logger.info(f"✅ [REDIS BLOOM SUCCESS] Chunk hash inséré (NOUVEAU) : {chunk_hash[:16]}... dans la clé '{cuckoo.key}'")
+            else:
+                logger.warning(f"⚠️ [REDIS BLOOM DUPLICATE] Chunk hash DÉJÀ PRÉSENT (Doublon) : {chunk_hash[:16]}...")
+
+        except Exception as e:
+            span.record_exception(e)
+            span.set_status(trace.Status(trace.StatusCode.ERROR, str(e)))
+            logger.error(f"❌ [REDIS BLOOM ERROR] Impossible d'écrire le hash {chunk_hash[:16]}... dans Redis : {e}", exc_info=True)
 
 # ─────────────────────────────────────────────────────────
 # Celery Task
 # ─────────────────────────────────────────────────────────
+
+        
 
 @shared_task(bind=True, max_retries=3)
 def persist_chunk(self, chunk_dict: dict):
@@ -171,18 +198,27 @@ def persist_chunk(self, chunk_dict: dict):
     try:
         chunk_data = ChunkData(**chunk_dict)
 
-        # On ouvre un bloc atomique global pour l'écriture SQL
-        with transaction.atomic():
-            _ensure_video_stub(chunk_data.video_id, chunk_data.user_id)
-            _persist_chunk_and_link(chunk_data)
-            
-            # CORRECTION DE LA RACE CONDITION / ROLLBACK FANTÔME :
-            # On demande à Django d'attendre que Postgres ait validé (COMMIT) l'écriture
-            # avant d'envoyer l'information à Redis.
-            transaction.on_commit(
-                lambda: _update_cuckoo_filter(chunk_data.sha256)
-            )
+        with tracer.start_as_current_span("chunk.persist") as span:
+            span.set_attribute("video.id", chunk_data.video_id)
+            span.set_attribute("chunk.index", chunk_data.chunk_index)
+            span.set_attribute("chunk.size_bytes", chunk_data.size_bytes)
 
+            # On ouvre un bloc atomique global pour l'écriture SQL
+            with transaction.atomic():
+                _ensure_video_stub(chunk_data.video_id, chunk_data.user_id)
+                _persist_chunk_and_link(chunk_data)
+
+                # CORRECTION DE LA RACE CONDITION / ROLLBACK FANTÔME :
+                # On demande à Django d'attendre que Postgres ait validé (COMMIT) l'écriture
+                # avant d'envoyer l'information à Redis.
+                transaction.on_commit(
+                    lambda: _update_cuckoo_filter(chunk_data.sha256)
+                )
     except Exception as exc:
+        span = trace.get_current_span()
+        span.set_attribute("task.retry_count", self.request.retries)
         logger.warning(f"[TASK RETRY] Erreur lors de la persistance du chunk: {exc}. Nouvelle tentative...")
         raise self.retry(exc=exc, countdown=2 ** self.request.retries)
+
+
+
